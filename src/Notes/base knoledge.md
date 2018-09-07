@@ -81,7 +81,7 @@
 |index|key word|paraphrace|
 |-|-|-|
 |0| break|end current loop |
-|1| case|used with swich or selection key-word,as the alternative additions|
+|1| case|used with switch or selection key-word,as the alternative additions|
 |3| chan|channel identifier ,located in front of the virable value ,use "<-" instead of "=" to assignment ,always one side waiting for the another side get/set the value|
 |4| const|constant identifier ,readonly and one-off assignment|
 |5| continue|skip this time loop|
@@ -89,7 +89,7 @@
 |7| defer|defer excecuting the rest part until the super lump ends|
 |8| else|alternative case when the above if-else cases neither works|
 |9| fallthrough|make the hide "break" disabled ,so it can continue until meet another hide "break"|
-|10| for|contais while & for|
+|10| for|contains while & for|
 |11| func|difine a method|
 |12| go|identifier for a |
 |13| goto|jump to a position ,need a displayed identifier|
