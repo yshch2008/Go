@@ -33,6 +33,7 @@ type Regs struct {
 	fs      uint64
 	gs      uint64
 	tls     uint64
+	context *_CONTEXT
 	fltSave *_XMM_SAVE_AREA32
 }
 
@@ -156,6 +157,20 @@ func (thread *Thread) SetSP(sp uint64) error {
 	}
 
 	context.Rsp = sp
+
+	return _SetThreadContext(thread.os.hThread, context)
+}
+
+func (thread *Thread) SetDX(dx uint64) error {
+	context := newCONTEXT()
+	context.ContextFlags = _CONTEXT_ALL
+
+	err := _GetThreadContext(thread.os.hThread, context)
+	if err != nil {
+		return err
+	}
+
+	context.Rdx = dx
 
 	return _SetThreadContext(thread.os.hThread, context)
 }
@@ -360,14 +375,16 @@ func registers(thread *Thread, floatingPoint bool) (proc.Registers, error) {
 	if floatingPoint {
 		regs.fltSave = &context.FltSave
 	}
+	regs.context = context
 
 	return regs, nil
 }
 
-type savedRegisters struct {
-}
-
-func (r *Regs) Save() proc.SavedRegisters {
-	//TODO(aarzilli): implement this to support function calls
-	return nil
+func (r *Regs) Copy() proc.Registers {
+	var rr Regs
+	rr = *r
+	rr.context = newCONTEXT()
+	*(rr.context) = *(r.context)
+	rr.fltSave = &rr.context.FltSave
+	return &rr
 }

@@ -58,13 +58,15 @@ type functionCallState struct {
 	// finished is true if the function call terminated
 	finished bool
 	// savedRegs contains the saved registers
-	savedRegs SavedRegisters
+	savedRegs Registers
 	// expr contains an expression describing the current function call
 	expr string
 	// err contains a saved error
 	err error
 	// fn is the function that is being called
 	fn *Function
+	// closureAddr is the address of the closure being called
+	closureAddr uint64
 	// argmem contains the argument frame of this function call
 	argmem []byte
 	// retvars contains the return variables after the function call terminates without panic'ing
@@ -110,6 +112,7 @@ func CallFunction(p Process, expr string, retLoadCfg *LoadConfig) error {
 	if err != nil {
 		return err
 	}
+	regs = regs.Copy()
 	if regs.SP()-256 <= g.stacklo {
 		return ErrNotEnoughStack
 	}
@@ -118,7 +121,7 @@ func CallFunction(p Process, expr string, retLoadCfg *LoadConfig) error {
 		return ErrFuncCallUnsupportedBackend
 	}
 
-	fn, argvars, err := funcCallEvalExpr(p, expr)
+	fn, closureAddr, argvars, err := funcCallEvalExpr(p, expr)
 	if err != nil {
 		return err
 	}
@@ -137,9 +140,10 @@ func CallFunction(p Process, expr string, retLoadCfg *LoadConfig) error {
 	}
 
 	fncall.inProgress = true
-	fncall.savedRegs = regs.Save()
+	fncall.savedRegs = regs
 	fncall.expr = expr
 	fncall.fn = fn
+	fncall.closureAddr = closureAddr
 	fncall.argmem = argmem
 	fncall.retLoadCfg = retLoadCfg
 
@@ -152,7 +156,7 @@ func fncallLog(fmtstr string, args ...interface{}) {
 	if !logflags.FnCall() {
 		return
 	}
-	logrus.WithFields(logrus.Fields{"layer": "proc", "kind": "fncall"}).Debugf(fmtstr, args...)
+	logrus.WithFields(logrus.Fields{"layer": "proc", "kind": "fncall"}).Infof(fmtstr, args...)
 }
 
 // writePointer writes val as an architecture pointer at addr in mem.
@@ -191,96 +195,74 @@ func callOP(bi *BinaryInfo, thread Thread, regs Registers, callAddr uint64) erro
 
 // funcCallEvalExpr evaluates expr, which must be a function call, returns
 // the function being called and its arguments.
-func funcCallEvalExpr(p Process, expr string) (fn *Function, argvars []*Variable, err error) {
+func funcCallEvalExpr(p Process, expr string) (fn *Function, closureAddr uint64, argvars []*Variable, err error) {
 	bi := p.BinInfo()
 	scope, err := GoroutineScope(p.CurrentThread())
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 
 	t, err := parser.ParseExpr(expr)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 	callexpr, iscall := t.(*ast.CallExpr)
 	if !iscall {
-		return nil, nil, ErrNotACallExpr
+		return nil, 0, nil, ErrNotACallExpr
 	}
 
-	//TODO(aarzilli): must evaluate <var>.<method> and treat them appropriately
 	fnvar, err := scope.evalAST(callexpr.Fun)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 	if fnvar.Kind != reflect.Func {
-		return nil, nil, fmt.Errorf("expression %q is not a function", exprToString(callexpr.Fun))
+		return nil, 0, nil, fmt.Errorf("expression %q is not a function", exprToString(callexpr.Fun))
+	}
+	fnvar.loadValue(LoadConfig{false, 0, 0, 0, 0})
+	if fnvar.Unreadable != nil {
+		return nil, 0, nil, fnvar.Unreadable
+	}
+	if fnvar.Base == 0 {
+		return nil, 0, nil, errors.New("nil pointer dereference")
 	}
 	fn = bi.PCToFunc(uint64(fnvar.Base))
 	if fn == nil {
-		return nil, nil, fmt.Errorf("could not find DIE for function %q", exprToString(callexpr.Fun))
+		return nil, 0, nil, fmt.Errorf("could not find DIE for function %q", exprToString(callexpr.Fun))
 	}
 	if !fn.cu.isgo {
-		return nil, nil, ErrNotAGoFunction
+		return nil, 0, nil, ErrNotAGoFunction
 	}
 
-	argvars = make([]*Variable, len(callexpr.Args))
+	argvars = make([]*Variable, 0, len(callexpr.Args)+1)
+	if len(fnvar.Children) > 0 {
+		// receiver argument
+		argvars = append(argvars, &fnvar.Children[0])
+	}
 	for i := range callexpr.Args {
-		argvars[i], err = scope.evalAST(callexpr.Args[i])
+		argvar, err := scope.evalAST(callexpr.Args[i])
 		if err != nil {
-			return nil, nil, err
+			return nil, 0, nil, err
 		}
-		argvars[i].Name = exprToString(callexpr.Args[i])
+		argvar.Name = exprToString(callexpr.Args[i])
+		argvars = append(argvars, argvar)
 	}
 
-	return fn, argvars, nil
+	return fn, fnvar.funcvalAddr(), argvars, nil
 }
 
 type funcCallArg struct {
-	name string
-	typ  godwarf.Type
-	off  int64
+	name  string
+	typ   godwarf.Type
+	off   int64
+	isret bool
 }
 
 // funcCallArgFrame checks type and pointer escaping for the arguments and
 // returns the argument frame.
 func funcCallArgFrame(fn *Function, actualArgs []*Variable, g *G, bi *BinaryInfo) (argmem []byte, err error) {
-	const CFA = 0x1000
-	vrdr := reader.Variables(bi.dwarf, fn.offset, fn.Entry, int(^uint(0)>>1), false)
-	formalArgs := []funcCallArg{}
-
-	// typechecks arguments, calculates argument frame size
-	argFrameSize := int64(0)
-	for vrdr.Next() {
-		e := vrdr.Entry()
-		if e.Tag != dwarf.TagFormalParameter {
-			continue
-		}
-		entry, argname, typ, err := readVarEntry(e, bi)
-		if err != nil {
-			return nil, err
-		}
-		typ = resolveTypedef(typ)
-		locprog, ok := entry.Val(dwarf.AttrLocation).([]byte)
-		if !ok {
-			return nil, fmt.Errorf("unsupported location expression for argument %s", argname)
-		}
-		off, _, err := op.ExecuteStackProgram(op.DwarfRegisters{CFA: CFA, FrameBase: CFA}, locprog)
-		if err != nil {
-			return nil, fmt.Errorf("unsupported location expression for argument %s: %v", argname, err)
-		}
-
-		off -= CFA
-
-		if e := off + typ.Size(); e > argFrameSize {
-			argFrameSize = e
-		}
-
-		if isret, _ := entry.Val(dwarf.AttrVarParam).(bool); !isret {
-			formalArgs = append(formalArgs, funcCallArg{name: argname, typ: typ, off: off})
-		}
-	}
-	if err := vrdr.Err(); err != nil {
-		return nil, fmt.Errorf("DWARF read error: %v", err)
+	argFrameSize, formalArgs, err := funcCallArgs(fn, bi, false)
+	if err != nil {
+		return nil, err
 	}
 	if len(actualArgs) > len(formalArgs) {
 		return nil, ErrTooManyArguments
@@ -289,46 +271,73 @@ func funcCallArgFrame(fn *Function, actualArgs []*Variable, g *G, bi *BinaryInfo
 		return nil, ErrNotEnoughArguments
 	}
 
-	sort.Slice(formalArgs, func(i, j int) bool {
-		return formalArgs[i].off < formalArgs[j].off
-	})
-
 	// constructs arguments frame
 	argmem = make([]byte, argFrameSize)
+	argmemWriter := &bufferMemoryReadWriter{argmem}
 	for i := range formalArgs {
 		formalArg := &formalArgs[i]
 		actualArg := actualArgs[i]
-
-		if actualArg.Addr == 0 {
-			//TODO(aarzilli): at least some of this needs to be supported
-			return nil, ErrNoAddrUnsupported
-		}
-
-		if actualArg.RealType != formalArg.typ {
-			return nil, fmt.Errorf("cannot use %s (type %s) as type %s in argument to %s", actualArg.Name, actualArg.DwarfType.String(), formalArg.typ.String(), fn.Name)
-		}
 
 		//TODO(aarzilli): only apply the escapeCheck to leaking parameters.
 		if err := escapeCheck(actualArg, formalArg.name, g); err != nil {
 			return nil, fmt.Errorf("can not pass %s to %s: %v", actualArg.Name, formalArg.name, err)
 		}
 
-		//TODO(aarzilli): automatic type conversions
-		//TODO(aarzilli): automatic wrapping in interfaces?
+		//TODO(aarzilli): autmoatic wrapping in interfaces for cases not handled
+		// by convertToEface.
 
-		buf := make([]byte, actualArg.RealType.Size())
-		sz, err := actualArg.mem.ReadMemory(buf, actualArg.Addr)
-		if err != nil {
-			return nil, fmt.Errorf("could not read argument %s: %v", actualArg.Name, err)
+		formalArgVar := newVariable(formalArg.name, uintptr(formalArg.off+fakeAddress), formalArg.typ, bi, argmemWriter)
+		if err := formalArgVar.setValue(actualArg, actualArg.Name); err != nil {
+			return nil, err
 		}
-		if int64(sz) != actualArg.RealType.Size() {
-			return nil, fmt.Errorf("short read for argument %s: %d != %d %x", actualArg.Name, sz, actualArg.RealType.Size(), buf)
-		}
-
-		copy(argmem[formalArg.off:], buf)
 	}
 
 	return argmem, nil
+}
+
+func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize int64, formalArgs []funcCallArg, err error) {
+	const CFA = 0x1000
+	vrdr := reader.Variables(bi.dwarf, fn.offset, fn.Entry, int(^uint(0)>>1), false)
+
+	// typechecks arguments, calculates argument frame size
+	for vrdr.Next() {
+		e := vrdr.Entry()
+		if e.Tag != dwarf.TagFormalParameter {
+			continue
+		}
+		entry, argname, typ, err := readVarEntry(e, bi)
+		if err != nil {
+			return 0, nil, err
+		}
+		typ = resolveTypedef(typ)
+		locprog, _, err := bi.locationExpr(entry, dwarf.AttrLocation, fn.Entry)
+		if err != nil {
+			return 0, nil, fmt.Errorf("could not get argument location of %s: %v", argname, err)
+		}
+		off, _, err := op.ExecuteStackProgram(op.DwarfRegisters{CFA: CFA, FrameBase: CFA}, locprog)
+		if err != nil {
+			return 0, nil, fmt.Errorf("unsupported location expression for argument %s: %v", argname, err)
+		}
+
+		off -= CFA
+
+		if e := off + typ.Size(); e > argFrameSize {
+			argFrameSize = e
+		}
+
+		if isret, _ := entry.Val(dwarf.AttrVarParam).(bool); !isret || includeRet {
+			formalArgs = append(formalArgs, funcCallArg{name: argname, typ: typ, off: off, isret: isret})
+		}
+	}
+	if err := vrdr.Err(); err != nil {
+		return 0, nil, fmt.Errorf("DWARF read error: %v", err)
+	}
+
+	sort.Slice(formalArgs, func(i, j int) bool {
+		return formalArgs[i].off < formalArgs[j].off
+	})
+
+	return argFrameSize, formalArgs, nil
 }
 
 func escapeCheck(v *Variable, name string, g *G) error {
@@ -359,7 +368,9 @@ func escapeCheck(v *Variable, name string, g *G) error {
 			}
 		}
 	case reflect.Func:
-		//TODO(aarzilli): check closure argument?
+		if err := escapeCheckPointer(uintptr(v.funcvalAddr()), name, g); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -367,7 +378,7 @@ func escapeCheck(v *Variable, name string, g *G) error {
 
 func escapeCheckPointer(addr uintptr, name string, g *G) error {
 	if uint64(addr) >= g.stacklo && uint64(addr) < g.stackhi {
-		return fmt.Errorf("stack object passed to escaping pointer %s", name)
+		return fmt.Errorf("stack object passed to escaping pointer: %s", name)
 	}
 	return nil
 }
@@ -391,6 +402,7 @@ func (fncall *functionCallState) step(p Process) {
 		fncall.inProgress = false
 		return
 	}
+	regs = regs.Copy()
 
 	rax, _ := regs.Get(int(x86asm.RAX))
 
@@ -427,7 +439,11 @@ func (fncall *functionCallState) step(p Process) {
 		if n != len(fncall.argmem) {
 			fncall.err = fmt.Errorf("short argument write: %d %d", n, len(fncall.argmem))
 		}
-		//TODO(aarzilli): if fncall.fn is a function closure CX needs to be set here
+		if fncall.closureAddr != 0 {
+			// When calling a function pointer we must set the DX register to the
+			// address of the function pointer itself.
+			thread.SetDX(fncall.closureAddr)
+		}
 		callOP(bi, thread, regs, fncall.fn.Entry)
 
 	case debugCallAXRestoreRegisters:

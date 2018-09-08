@@ -243,3 +243,15 @@ func SafeRemoveAll(dir string) {
 	}
 	os.Remove(dir)
 }
+
+// MustSupportFunctionCalls skips this test if function calls are
+// unsupported on this backend/architecture pair.
+func MustSupportFunctionCalls(t *testing.T, testBackend string) {
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 11) {
+		t.Skip("this version of Go does not support function calls")
+	}
+
+	if testBackend == "rr" || (runtime.GOOS == "darwin" && testBackend == "native") {
+		t.Skip("this backend does not support function calls")
+	}
+}

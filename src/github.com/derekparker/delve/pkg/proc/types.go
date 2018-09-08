@@ -192,21 +192,31 @@ func (bi *BinaryInfo) loadDebugInfoMaps(debugLineBytes []byte, wg *sync.WaitGrou
 	bi.consts = make(map[dwarf.Offset]*constantType)
 	bi.runtimeTypeToDIE = make(map[uint64]runtimeTypeDIE)
 	reader := bi.DwarfReader()
+	ardr := bi.DwarfReader()
 	var cu *compileUnit = nil
 	var pu *partialUnit = nil
 	var partialUnits = make(map[dwarf.Offset]*partialUnit)
+	abstractOriginNameTable := make(map[dwarf.Offset]string)
+	var lastOffset dwarf.Offset
+
+outer:
 	for entry, err := reader.Next(); entry != nil; entry, err = reader.Next() {
 		if err != nil {
 			break
 		}
+		lastOffset = entry.Offset
 		switch entry.Tag {
 		case dwarf.TagCompileUnit:
 			if pu != nil {
 				partialUnits[pu.entry.Offset] = pu
 				pu = nil
 			}
+			if cu != nil {
+				cu.endOffset = entry.Offset
+			}
 			cu = &compileUnit{}
 			cu.entry = entry
+			cu.startOffset = entry.Offset
 			if lang, _ := entry.Val(dwarf.AttrLanguage).(int64); lang == dwarfGoLanguage {
 				cu.isgo = true
 			}
@@ -320,9 +330,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(debugLineBytes []byte, wg *sync.WaitGrou
 					}
 				}
 			}
-			if off, ok := entry.Val(godwarf.AttrGoRuntimeType).(uint64); ok {
-				bi.runtimeTypeToDIE[off] = runtimeTypeDIE{entry.Offset, -1}
-			}
+			bi.registerRuntimeTypeToDIE(entry, ardr)
 			reader.SkipChildren()
 
 		case dwarf.TagVariable:
@@ -365,37 +373,84 @@ func (bi *BinaryInfo) loadDebugInfoMaps(debugLineBytes []byte, wg *sync.WaitGrou
 
 		case dwarf.TagSubprogram:
 			ok1 := false
+			inlined := false
 			var lowpc, highpc uint64
+			if inval, ok := entry.Val(dwarf.AttrInline).(int64); ok {
+				inlined = inval == 1
+			}
 			if ranges, _ := bi.dwarf.Ranges(entry); len(ranges) == 1 {
 				ok1 = true
 				lowpc = ranges[0][0]
 				highpc = ranges[0][1]
 			}
 			name, ok2 := entry.Val(dwarf.AttrName).(string)
-			if ok1 && ok2 {
+			var fn Function
+			if (ok1 == !inlined) && ok2 {
+				if inlined {
+					abstractOriginNameTable[entry.Offset] = name
+				}
 				if pu != nil {
-					pu.functions = append(pu.functions, Function{
+					fn = Function{
 						Name:  name,
 						Entry: lowpc, End: highpc,
 						offset: entry.Offset,
 						cu:     &compileUnit{},
-					})
+					}
+					pu.functions = append(pu.functions, fn)
 				} else {
 					if !cu.isgo {
 						name = "C." + name
 					}
-					bi.Functions = append(bi.Functions, Function{
+					fn = Function{
 						Name:  name,
 						Entry: lowpc, End: highpc,
 						offset: entry.Offset,
 						cu:     cu,
-					})
+					}
+					bi.Functions = append(bi.Functions, fn)
 				}
 			}
-			reader.SkipChildren()
-
+			if entry.Children {
+				for {
+					entry, err = reader.Next()
+					if err != nil {
+						break outer
+					}
+					if entry.Tag == 0 {
+						break
+					}
+					if entry.Tag == dwarf.TagInlinedSubroutine {
+						originOffset := entry.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
+						name := abstractOriginNameTable[originOffset]
+						if ranges, _ := bi.dwarf.Ranges(entry); len(ranges) == 1 {
+							ok1 = true
+							lowpc = ranges[0][0]
+							highpc = ranges[0][1]
+						}
+						callfileidx, ok1 := entry.Val(dwarf.AttrCallFile).(int64)
+						callline, ok2 := entry.Val(dwarf.AttrCallLine).(int64)
+						if ok1 && ok2 {
+							callfile := cu.lineInfo.FileNames[callfileidx-1].Path
+							cu.concreteInlinedFns = append(cu.concreteInlinedFns, inlinedFn{
+								Name:     name,
+								LowPC:    lowpc,
+								HighPC:   highpc,
+								CallFile: callfile,
+								CallLine: callline,
+								Parent:   &fn,
+							})
+						}
+					}
+					reader.SkipChildren()
+				}
+			}
 		}
 	}
+
+	if cu != nil {
+		cu.endOffset = lastOffset + 1
+	}
+
 	sort.Sort(compileUnitsByLowpc(bi.compileUnits))
 	sort.Sort(functionsDebugInfoByEntry(bi.Functions))
 	sort.Sort(packageVarsByAddr(bi.packageVars))
@@ -469,6 +524,14 @@ func (bi *BinaryInfo) expandPackagesInType(expr ast.Expr) {
 		bi.expandPackagesInType(e.X)
 	default:
 		// nothing to do
+	}
+}
+
+func (bi *BinaryInfo) registerRuntimeTypeToDIE(entry *dwarf.Entry, ardr *reader.Reader) {
+	if off, ok := entry.Val(godwarf.AttrGoRuntimeType).(uint64); ok {
+		if _, ok := bi.runtimeTypeToDIE[off]; !ok {
+			bi.runtimeTypeToDIE[off] = runtimeTypeDIE{entry.Offset, -1}
+		}
 	}
 }
 
@@ -1176,4 +1239,37 @@ func constructTypeForKind(kind int64, bi *BinaryInfo) (*godwarf.StructType, erro
 	default:
 		return nil, nil
 	}
+}
+
+func dwarfToRuntimeType(bi *BinaryInfo, mem MemoryReadWriter, typ godwarf.Type) (typeAddr uint64, typeKind uint64, found bool, err error) {
+	rdr := bi.DwarfReader()
+	rdr.Seek(typ.Common().Offset)
+	e, err := rdr.Next()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	off, ok := e.Val(godwarf.AttrGoRuntimeType).(uint64)
+	if !ok {
+		return 0, 0, false, nil
+	}
+
+	if err := loadModuleData(bi, mem); err != nil {
+		return 0, 0, false, err
+	}
+
+	//TODO(aarzilli): when we support plugins this should be the plugin
+	//corresponding to the shared object containing entry 'e'.
+	typeAddr = uint64(bi.moduleData[0].types) + off
+
+	rtyp, err := bi.findType("runtime._type")
+	if err != nil {
+		return 0, 0, false, err
+	}
+	_type := newVariable("", uintptr(typeAddr), rtyp, bi, mem)
+	kindv := _type.loadFieldNamed("kind")
+	if kindv.Unreadable != nil || kindv.Kind != reflect.Uint {
+		return 0, 0, false, fmt.Errorf("unreadable interface type: %v", kindv.Unreadable)
+	}
+	typeKind, _ = constant.Uint64Val(kindv.Value)
+	return typeAddr, typeKind, true, nil
 }

@@ -2929,6 +2929,11 @@ func TestIssue877(t *testing.T) {
 	if runtime.GOOS != "darwin" && testBackend == "lldb" {
 		return
 	}
+	if os.Getenv("TRAVIS") == "true" && runtime.GOOS == "darwin" {
+		// Something changed on Travis side that makes the Go compiler fail if
+		// DYLD_LIBRARY_PATH is set.
+		t.Skip("broken")
+	}
 	const envval = "/usr/local/lib"
 	os.Setenv("DYLD_LIBRARY_PATH", envval)
 	withTestProcess("issue877", t, func(p proc.Process, fixture protest.Fixture) {
@@ -3751,6 +3756,48 @@ func TestInlineStepOut(t *testing.T) {
 	})
 }
 
+func TestInlineFunctionList(t *testing.T) {
+	// We should be able to list all functions, even inlined ones.
+	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 10, -1, 0, 0, ""}) {
+		// Versions of go before 1.10 do not have DWARF information for inlined calls
+		t.Skip("inlining not supported")
+	}
+	withTestProcessArgs("testinline", t, ".", []string{}, protest.EnableInlining|protest.EnableOptimization, func(p proc.Process, fixture protest.Fixture) {
+		var found bool
+		for _, fn := range p.BinInfo().Functions {
+			if strings.Contains(fn.Name, "inlineThis") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatal("inline function not returned")
+		}
+	})
+}
+
+func TestInlineBreakpoint(t *testing.T) {
+	// We should be able to set a breakpoint on the call site of an inlined function.
+	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 10, -1, 0, 0, ""}) {
+		// Versions of go before 1.10 do not have DWARF information for inlined calls
+		t.Skip("inlining not supported")
+	}
+	withTestProcessArgs("testinline", t, ".", []string{}, protest.EnableInlining|protest.EnableOptimization, func(p proc.Process, fixture protest.Fixture) {
+		pc, fn, err := p.BinInfo().LineToPC(fixture.Source, 17)
+		if pc == 0 {
+			t.Fatal("unable to get PC for inlined function call")
+		}
+		expectedFn := "main.main"
+		if fn.Name != expectedFn {
+			t.Fatalf("incorrect function returned, expected %s, got %s", expectedFn, fn.Name)
+		}
+		_, err = p.SetBreakpoint(pc, proc.UserBreakpoint, nil)
+		if err != nil {
+			t.Fatalf("unable to set breakpoint: %v", err)
+		}
+	})
+}
+
 func TestIssue951(t *testing.T) {
 	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 9, -1, 0, 0, ""}) {
 		t.Skip("scopes not implemented in <=go1.8")
@@ -3947,5 +3994,17 @@ func TestReadDefer(t *testing.T) {
 				defercheck(frame.Defers[deferIdx], fmt.Sprintf("defer %d", deferIdx), example.defers[deferIdx], example.frameIdx)
 			}
 		}
+	})
+}
+
+func TestNextUnknownInstr(t *testing.T) {
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 10) {
+		t.Skip("versions of Go before 1.10 can't assemble the instruction VPUNPCKLWD")
+	}
+	withTestProcess("nodisasm/", t, func(p proc.Process, fixture protest.Fixture) {
+		_, err := setFunctionBreakpoint(p, "main.asmFunc")
+		assertNoError(err, t, "setFunctionBreakpoint()")
+		assertNoError(proc.Continue(p), t, "Continue()")
+		assertNoError(proc.Next(p), t, "Next()")
 	})
 }

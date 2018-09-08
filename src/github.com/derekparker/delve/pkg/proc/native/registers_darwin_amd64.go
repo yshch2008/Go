@@ -126,6 +126,10 @@ func (thread *Thread) SetSP(sp uint64) error {
 	return errors.New("not implemented")
 }
 
+func (thread *Thread) SetDX(dx uint64) error {
+	return errors.New("not implemented")
+}
+
 func (r *Regs) Get(n int) (uint64, error) {
 	reg := x86asm.Reg(n)
 	const (
@@ -363,10 +367,7 @@ func registers(thread *Thread, floatingPoint bool) (proc.Registers, error) {
 	return regs, nil
 }
 
-type savedRegisters struct {
-}
-
-func (r *Regs) Save() proc.SavedRegisters {
+func (r *Regs) Copy() proc.Registers {
 	//TODO(aarzilli): implement this to support function calls
 	return nil
 }

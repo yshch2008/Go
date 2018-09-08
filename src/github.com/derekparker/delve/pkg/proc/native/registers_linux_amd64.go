@@ -115,6 +115,18 @@ func (thread *Thread) SetSP(sp uint64) (err error) {
 	return
 }
 
+func (thread *Thread) SetDX(dx uint64) (err error) {
+	var ir proc.Registers
+	ir, err = registers(thread, false)
+	if err != nil {
+		return err
+	}
+	r := ir.(*Regs)
+	r.regs.Rdx = dx
+	thread.dbp.execPtraceFunc(func() { err = sys.PtraceSetRegs(thread.ID, r.regs) })
+	return
+}
+
 func (r *Regs) Get(n int) (uint64, error) {
 	reg := x86asm.Reg(n)
 	const (
@@ -312,14 +324,17 @@ func (thread *Thread) fpRegisters() (regs []proc.Register, fpregs proc.LinuxX86X
 	return
 }
 
-type savedRegisters struct {
-	regs   sys.PtraceRegs
-	fpregs proc.LinuxX86Xstate
-}
-
-func (r *Regs) Save() proc.SavedRegisters {
-	savedRegs := &savedRegisters{}
-	savedRegs.regs = *r.regs
-	savedRegs.fpregs = *r.fpregset
-	return savedRegs
+func (r *Regs) Copy() proc.Registers {
+	var rr Regs
+	rr.regs = &sys.PtraceRegs{}
+	rr.fpregset = &proc.LinuxX86Xstate{}
+	*(rr.regs) = *(r.regs)
+	if r.fpregset != nil {
+		*(rr.fpregset) = *(r.fpregset)
+	}
+	if r.fpregs != nil {
+		rr.fpregs = make([]proc.Register, len(r.fpregs))
+		copy(rr.fpregs, r.fpregs)
+	}
+	return &rr
 }

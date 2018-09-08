@@ -79,13 +79,17 @@ var UnsupportedDarwinArchErr = errors.New("unsupported architecture - only darwi
 const dwarfGoLanguage = 22 // DW_LANG_Go (from DWARF v5, section 7.12, page 231)
 
 type compileUnit struct {
-	entry         *dwarf.Entry        // debug_info entry describing this compile unit
-	isgo          bool                // true if this is the go compile unit
-	Name          string              // univocal name for non-go compile units
-	lineInfo      *line.DebugLineInfo // debug_line segment associated with this compile unit
+	Name          string // univocal name for non-go compile units
 	LowPC, HighPC uint64
-	optimized     bool   // this compile unit is optimized
-	producer      string // producer attribute
+
+	entry              *dwarf.Entry        // debug_info entry describing this compile unit
+	isgo               bool                // true if this is the go compile unit
+	lineInfo           *line.DebugLineInfo // debug_line segment associated with this compile unit
+	concreteInlinedFns []inlinedFn         // list of concrete inlined functions within this compile unit
+	optimized          bool                // this compile unit is optimized
+	producer           string              // producer attribute
+
+	startOffset, endOffset dwarf.Offset // interval of offsets contained in this compile unit
 }
 
 type partialUnitConstant struct {
@@ -100,6 +104,16 @@ type partialUnit struct {
 	variables []packageVar
 	constants []partialUnitConstant
 	functions []Function
+}
+
+// inlinedFn represents a concrete inlined function, e.g.
+// an entry for the generated code of an inlined function.
+type inlinedFn struct {
+	Name          string    // Name of the function that was inlined
+	LowPC, HighPC uint64    // Address range of the generated inlined instructions
+	CallFile      string    // File of the call site of the inlined function
+	CallLine      int64     // Line of the call site of the inlined function
+	Parent        *Function // The function that contains this inlined function
 }
 
 // Function describes a function in the target program.
@@ -320,6 +334,17 @@ func (bi *BinaryInfo) LineToPC(filename string, lineno int) (pc uint64, fn *Func
 	for _, cu := range bi.compileUnits {
 		if cu.lineInfo.Lookup[filename] != nil {
 			pc = cu.lineInfo.LineToPC(filename, lineno)
+			if pc == 0 {
+				// Check to see if this file:line belongs to the call site
+				// of an inlined function.
+				for _, ifn := range cu.concreteInlinedFns {
+					if strings.Contains(ifn.CallFile, filename) && ifn.CallLine == int64(lineno) {
+						pc = ifn.LowPC
+						fn = ifn.Parent
+						return
+					}
+				}
+			}
 			fn = bi.PCToFunc(pc)
 			if fn != nil {
 				return
@@ -398,38 +423,45 @@ func (bi *BinaryInfo) loclistInit(data []byte) {
 	bi.loclist.ptrSz = bi.Arch.PtrSize()
 }
 
-// Location returns the location described by attribute attr of entry.
-// This will either be an int64 address or a slice of Pieces for locations
-// that don't correspond to a single memory address (registers, composite
-// locations).
-func (bi *BinaryInfo) Location(entry reader.Entry, attr dwarf.Attr, pc uint64, regs op.DwarfRegisters) (int64, []op.Piece, string, error) {
+func (bi *BinaryInfo) locationExpr(entry reader.Entry, attr dwarf.Attr, pc uint64) ([]byte, string, error) {
 	a := entry.Val(attr)
 	if a == nil {
-		return 0, nil, "", fmt.Errorf("no location attribute %s", attr)
+		return nil, "", fmt.Errorf("no location attribute %s", attr)
 	}
 	if instr, ok := a.([]byte); ok {
 		var descr bytes.Buffer
 		fmt.Fprintf(&descr, "[block] ")
 		op.PrettyPrint(&descr, instr)
-		addr, pieces, err := op.ExecuteStackProgram(regs, instr)
-		return addr, pieces, descr.String(), err
+		return instr, descr.String(), nil
 	}
 	off, ok := a.(int64)
 	if !ok {
-		return 0, nil, "", fmt.Errorf("could not interpret location attribute %s", attr)
+		return nil, "", fmt.Errorf("could not interpret location attribute %s", attr)
 	}
 	if bi.loclist.data == nil {
-		return 0, nil, "", fmt.Errorf("could not find loclist entry at %#x for address %#x (no debug_loc section found)", off, pc)
+		return nil, "", fmt.Errorf("could not find loclist entry at %#x for address %#x (no debug_loc section found)", off, pc)
 	}
 	instr := bi.loclistEntry(off, pc)
 	if instr == nil {
-		return 0, nil, "", fmt.Errorf("could not find loclist entry at %#x for address %#x", off, pc)
+		return nil, "", fmt.Errorf("could not find loclist entry at %#x for address %#x", off, pc)
 	}
 	var descr bytes.Buffer
 	fmt.Fprintf(&descr, "[%#x:%#x] ", off, pc)
 	op.PrettyPrint(&descr, instr)
+	return instr, descr.String(), nil
+}
+
+// Location returns the location described by attribute attr of entry.
+// This will either be an int64 address or a slice of Pieces for locations
+// that don't correspond to a single memory address (registers, composite
+// locations).
+func (bi *BinaryInfo) Location(entry reader.Entry, attr dwarf.Attr, pc uint64, regs op.DwarfRegisters) (int64, []op.Piece, string, error) {
+	instr, descr, err := bi.locationExpr(entry, attr, pc)
+	if err != nil {
+		return 0, nil, "", err
+	}
 	addr, pieces, err := op.ExecuteStackProgram(regs, instr)
-	return addr, pieces, descr.String(), err
+	return addr, pieces, descr, err
 }
 
 // loclistEntry returns the loclist entry in the loclist starting at off,
@@ -459,6 +491,15 @@ func (bi *BinaryInfo) loclistEntry(off int64, pc uint64) []byte {
 func (bi *BinaryInfo) findCompileUnit(pc uint64) *compileUnit {
 	for _, cu := range bi.compileUnits {
 		if pc >= cu.LowPC && pc < cu.HighPC {
+			return cu
+		}
+	}
+	return nil
+}
+
+func (bi *BinaryInfo) findCompileUnitForOffset(off dwarf.Offset) *compileUnit {
+	for _, cu := range bi.compileUnits {
+		if off >= cu.startOffset && off < cu.endOffset {
 			return cu
 		}
 	}

@@ -125,6 +125,9 @@ func (t *Thread) WriteMemory(addr uintptr, data []byte) (int, error) {
 	if t.dbp.exited {
 		return 0, proc.ProcessExitedError{Pid: t.dbp.pid}
 	}
+	if len(data) == 0 {
+		return 0, nil
+	}
 	var count uintptr
 	err := _WriteProcessMemory(t.dbp.os.hProcess, addr, &data[0], uintptr(len(data)), &count)
 	if err != nil {
@@ -150,6 +153,6 @@ func (t *Thread) ReadMemory(buf []byte, addr uintptr) (int, error) {
 	return int(count), err
 }
 
-func (t *Thread) restoreRegisters(sr *savedRegisters) error {
-	return errors.New("not implemented")
+func (t *Thread) restoreRegisters(savedRegs proc.Registers) error {
+	return _SetThreadContext(t.os.hThread, savedRegs.(*Regs).context)
 }

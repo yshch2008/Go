@@ -74,12 +74,8 @@ Aliases: bp
 Resumes process, injecting a function call (EXPERIMENTAL!!!)
 	
 Current limitations:
-- can only call package-level functions, no function pointers nor methods.
-- only things that have an address can be used as arguments (no literal
-  constants or results of evaluating some expressions).
 - only pointers to stack-allocated objects can be passed as argument.
-- no automatic type conversions are supported, including automatically
-  converting to an interface type.
+- only some automatic type conversions are supported.
 - functions can only be called on running goroutines that are not
   executing the runtime.
 - the current goroutine needs to have at least 256 bytes of free space on
@@ -186,6 +182,10 @@ Move the current frame down by <m>. The second form runs the command on the give
 
 ## edit
 Open where you are in $DELVE_EDITOR or $EDITOR
+
+	edit [locspec]
+	
+If locspec is omitted edit will open the current source file in the editor, otherwise it will open the specified location.
 
 Aliases: ed
 

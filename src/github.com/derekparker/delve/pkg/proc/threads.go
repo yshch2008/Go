@@ -22,9 +22,17 @@ type Thread interface {
 	// nil if the thread is not stopped at any breakpoint.
 	Breakpoint() BreakpointState
 	ThreadID() int
+
+	// Registers returns the CPU registers of this thread. The contents of the
+	// variable returned may or may not change to reflect the new CPU status
+	// when the thread is resumed or the registers are changed by calling
+	// SetPC/SetSP/etc.
+	// To insure that the the returned variable won't change call the Copy
+	// method of Registers.
 	Registers(floatingPoint bool) (Registers, error)
+
 	// RestoreRegisters restores saved registers
-	RestoreRegisters(SavedRegisters) error
+	RestoreRegisters(Registers) error
 	Arch() Arch
 	BinInfo() *BinaryInfo
 	StepInstruction() error
@@ -37,6 +45,7 @@ type Thread interface {
 
 	SetPC(uint64) error
 	SetSP(uint64) error
+	SetDX(uint64) error
 }
 
 // Location represents the location of a thread.

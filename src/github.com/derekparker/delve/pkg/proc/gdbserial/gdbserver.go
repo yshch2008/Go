@@ -187,6 +187,7 @@ func New(process *os.Process) *Process {
 		gcmdok:         true,
 		threadStopInfo: true,
 		process:        process,
+		common:         proc.NewCommonProcess(true),
 	}
 
 	if process != nil {
@@ -1188,9 +1189,9 @@ func (t *Thread) Registers(floatingPoint bool) (proc.Registers, error) {
 	return &t.regs, nil
 }
 
-func (t *Thread) RestoreRegisters(regs proc.SavedRegisters) error {
-	//TODO(aarzilli): implement
-	return errors.New("not implemented")
+func (t *Thread) RestoreRegisters(savedRegs proc.Registers) error {
+	copy(t.regs.buf, savedRegs.(*gdbRegisters).buf)
+	return t.writeRegisters()
 }
 
 func (t *Thread) Arch() proc.Arch {
@@ -1339,6 +1340,18 @@ func (t *Thread) writeSomeRegisters(regNames ...string) error {
 	}
 	for _, regName := range regNames {
 		if err := t.p.conn.writeRegister(t.strID, t.regs.regs[regName].regnum, t.regs.regs[regName].value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *Thread) writeRegisters() error {
+	if t.p.gcmdok {
+		return t.p.conn.writeRegisters(t.strID, t.regs.buf)
+	}
+	for _, r := range t.regs.regs {
+		if err := t.p.conn.writeRegister(t.strID, r.regnum, r.value); err != nil {
 			return err
 		}
 	}
@@ -1531,6 +1544,10 @@ func (regs *gdbRegisters) SP() uint64 {
 }
 func (regs *gdbRegisters) setSP(value uint64) {
 	binary.LittleEndian.PutUint64(regs.regs[regnameSP].value, value)
+}
+
+func (regs *gdbRegisters) setDX(value uint64) {
+	binary.LittleEndian.PutUint64(regs.regs[regnameDX].value, value)
 }
 
 func (regs *gdbRegisters) BP() uint64 {
@@ -1736,6 +1753,15 @@ func (t *Thread) SetSP(sp uint64) error {
 	return t.p.conn.writeRegister(t.strID, reg.regnum, reg.value)
 }
 
+func (t *Thread) SetDX(dx uint64) error {
+	t.regs.setDX(dx)
+	if t.p.gcmdok {
+		return t.p.conn.writeRegisters(t.strID, t.regs.buf)
+	}
+	reg := t.regs.regs[regnameDX]
+	return t.p.conn.writeRegister(t.strID, reg.regnum, reg.value)
+}
+
 func (regs *gdbRegisters) Slice() []proc.Register {
 	r := make([]proc.Register, 0, len(regs.regsInfo))
 	for _, reginfo := range regs.regsInfo {
@@ -1778,7 +1804,7 @@ func (regs *gdbRegisters) Slice() []proc.Register {
 	return r
 }
 
-func (regs *gdbRegisters) Save() proc.SavedRegisters {
+func (regs *gdbRegisters) Copy() proc.Registers {
 	savedRegs := &gdbRegisters{}
 	savedRegs.init(regs.regsInfo)
 	copy(savedRegs.buf, regs.buf)
